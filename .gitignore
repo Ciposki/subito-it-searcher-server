@@ -1,3 +1,21 @@
-telegram-send.conf
-searches.tracked
+# --- Project Specific Secrets ---
 telegram_api_credentials
+searches.tracked
+schema.sql
+
+# --- Database & Data ---
+*.db
+annunci.db
+# --- Virtual Environment (The bin, include, lib folders) ---
+bin/
+include/
+lib/
+lib64/
+pyvenv.cfg
+
+# --- Python Junk ---
+__pycache__/
+*.py[cod]
+
+# --- Editor Junk ---
+.netrwhist

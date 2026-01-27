@@ -1,6 +1,8 @@
 #!/usr/bin/env python3.7
 
+import random
 import argparse
+from contextlib import nullcontext
 import requests
 from bs4 import BeautifulSoup, Tag
 import json
@@ -9,8 +11,12 @@ import platform
 import requests
 import re
 import time as t
+import sqlite3
+import sys
 from datetime import datetime, time
+from curl_cffi import requests # <-- The Stealth Engine
 
+# Use a session to keep cookies/connection alive like a real browser
 parser = argparse.ArgumentParser()
 parser.add_argument("--add", dest='name', help="name of new tracking to be added")
 parser.add_argument("--url", help="url for your new tracking's search query")
@@ -42,29 +48,42 @@ parser.set_defaults(ntfyoff=False)
 
 args = parser.parse_args()
 
-queries = dict()
+session = requests.Session()
 apiCredentials = dict()
 ntfyConfig = dict()
 ntfyConfigFile = "ntfy_config"
 dbFile = "searches.tracked"
 telegramApiFile = "telegram_api_credentials"
 
+conn=None
+cursor=None
+#database connection
+
 # Windows notifications
 if platform.system() == "Windows":
     from win10toast import ToastNotifier
     toaster = ToastNotifier()
 
+def connect_database():
+    global conn, cursor # Dichiariamo le globali prima
+    
+    try:
+        # Proviamo a connetterci
+        conn = sqlite3.connect('annunci.db')
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.row_factory = sqlite3.Row 
+        cursor = conn.cursor()
+        # Test rapido per vedere se il DB risponde davvero
+        conn.execute("SELECT 1")
+        print("✅ Connessione riuscita: Il database è pronto!")
+        
+    except sqlite3.Error as e:
+        # Se qualcosa va storto, stampiamo l'errore e chiudiamo tutto
+        print(f"❌ Errore fatale al database: {e}")
+        print("Uscita in corso...")
+        sys.exit(1) # Esce dallo script con codice di errore 1
 
-# load from file
-def load_queries():
-    '''A function to load the queries from the json file'''
-    global queries
-    global dbFile
-    if not os.path.isfile(dbFile):
-        return
 
-    with open(dbFile) as file:
-        queries = json.load(file)
 
 def load_api_credentials():
     '''A function to load the telegram api credentials from the json file'''
@@ -87,268 +106,247 @@ def load_ntfy_config():
         ntfyConfig = json.load(file)
 
 def print_queries():
-    '''A function to print the queries'''
-    global queries
-    #print(queries, "\n\n")
+    '''Una funzione per stampare le ricerche e i relativi annunci dal DB'''
+    # 1. Prendiamo tutte le ricerche salvate
+    cursor.execute("SELECT nome, url FROM ricerche")
+    ricerche = cursor.fetchall()
 
-    for search in queries.items():
-        print("\nsearch: ", search[0])
-        for query_url in search[1]:
-            print("query url:", query_url)
-            for url in search[1].items():
-                for minP in url[1].items():
-                    for maxP in minP[1].items():
-                        for result in maxP[1].items():
-                            print("\n", result[1].get('title'), ":", result[1].get('price'), "-->", result[1].get('location'))
-                            print(" ", result[0])
+    if not ricerche:
+        print("\n📭 Nessuna ricerca tracciata nel database.")
+        return
+
+    for r in ricerche:
+        nome_ricerca = r['nome']
+        url_ricerca = r['url']
+        
+        print(f"\nsearch: {nome_ricerca}")
+        print(f"query url: {url_ricerca}")
+
+        # 2. Per ogni ricerca, prendiamo gli annunci collegati (JOIN mentale)
+        cursor.execute("""
+            SELECT titolo, prezzo, localita, link 
+            FROM annunci 
+            WHERE categoria = ?
+        """, (nome_ricerca,))
+        
+        annunci = cursor.fetchall()
+
+        if not annunci:
+            print("  (Nessun annuncio trovato per questa ricerca)")
+        else:
+            for a in annunci:
+                # Stampiamo i dati proprio come facevi prima
+                print(f"\n {a['titolo']} : {a['prezzo']} --> {a['localita']}")
+                print(f"  {a['link']}")
 
 
 # printing a compact list of trackings
 def print_sitrep():
-    '''A function to print a compact list of trackings'''
-    global queries
-    i = 1
-    for search in queries.items():
-        print('\n{}) search: {}'.format(i, search[0]))
-        for query_url in search[1].items():
-            for minP in query_url[1].items():
-                for maxP in minP[1].items():
-                    print("query url:", query_url[0], " ", end='')
-                    if minP[0] !="null":
-                        print(minP[0],"<", end='')
-                    if minP[0] !="null" or maxP[0] !="null":
-                        print(" price ", end='')
-                    if maxP[0] !="null":
-                        print("<", maxP[0], end='')
-                    print("\n")
+    '''Una funzione per stampare la lista compatta delle ricerche dal DB'''
+    # 1. Interroghiamo la tabella ricerche
+    cursor.execute("SELECT nome, url, prezzo_min, prezzo_max FROM ricerche")
+    ricerche = cursor.fetchall()
 
-        i+=1
-
-def refresh(notify):
-    '''A function to refresh the queries
-
-    Arguments
-    ---------
-    notify: bool
-        whether to send notifications or not
-
-    Example usage
-    -------------
-    >>> refresh(True)   # Refresh queries and send notifications
-    >>> refresh(False)  # Refresh queries and don't send notifications
-    '''
-    global queries
-    try:
-        for search in queries.items():
-            for url in search[1].items():
-                for minP in url[1].items():
-                    for maxP in minP[1].items():
-                        run_query(url[0], search[0], notify, minP[0], maxP[0])
-    except requests.exceptions.ConnectionError:
-        print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " ***Connection error***")
-    except requests.exceptions.Timeout:
-        print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " ***Server timeout error***")
-    except requests.exceptions.HTTPError:
-        print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " ***HTTP error***")
-    except Exception as e:
-        print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " " + e)
-
-
-def delete(toDelete):
-    '''A function to delete a query
-
-    Arguments
-    ---------
-    toDelete: str
-        the query to delete
-
-    Example usage
-    -------------
-    >>> delete("query")
-    '''
-    global queries
-    queries.pop(toDelete)
-
-def add(url, name, minPrice, maxPrice):
-    ''' A function to add a new query
-
-    Arguments
-    ---------
-    url: str
-        the url to run the query on
-    name: str
-        the name of the query
-    minPrice: str
-        the minimum price to search for
-    maxPrice: str
-        the maximum price to search for
-
-    Example usage
-    -------------
-    >>> add("https://www.subito.it/annunci-italia/vendita/usato/?q=auto", "auto", 100, "null")
-    '''
-    global queries
-
-    # If the query has already been added previously, delete it
-    if queries.get(name):
-        delete(name)
-
-    queries[name] = {url:{minPrice: {maxPrice:{}}}}
-
-
-def run_query(url, name, notify, minPrice, maxPrice):
-    '''A function to run a query
-
-    Arguments
-    ---------
-    url: str
-        the url to run the query on
-    name: str
-        the name of the query
-    notify: bool
-        whether to send notifications or not
-    minPrice: str
-        the minimum price to search for
-    maxPrice: str
-        the maximum price to search for
-
-    Example usage
-    -------------
-    >>> run_query("https://www.subito.it/annunci-italia/vendita/usato/?q=auto", "query", True, 100, "null")
-    '''
-    print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " running query (\"{}\" - {})...".format(name, url))
-
-    products_deleted = False
-
-    global queries
-    headers = {
-     "Accept": '"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"',
-     "Accept-Encoding": '"gzip, deflate"',
-     "Accept-Language": '"en-US,en;q=0.5"',
-     "Connection": '"keep-alive"',
-     "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Brave";v="128"',
-     "Sec-Ch-Ua-Mobile": '"?0"',
-     "Sec-Ch-Ua-Platform": '"Windows"',
-     "Sec-Fetch-Dest": '"document"',
-     "Sec-Fetch-Mode": '"navigate"',
-     "Sec-Fetch-Site": '"none"',
-     "Sec-Fetch-User": '"?1"',
-     "Sec-Gpc": '"1"',
-     "Upgrade-Insecure-Requests": '"1"',
-     "User-Agent": '"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"'
-    }
-
-    page = requests.get(url, headers=headers)
-    soup = BeautifulSoup(page.text, 'html.parser')
-
-    script_tag = soup.find('script', id='__NEXT_DATA__')
-    if not script_tag:
-        print("Error: Could not find JSON data on page (Next.js data not found).")
+    if not ricerche:
+        print("\n📭 Nessuna ricerca tracciata nel database.")
         return
 
-    json_data = json.loads(script_tag.string)
+    # Usiamo enumerate per mantenere il conteggio (i) come nello script originale
+    for i, r in enumerate(ricerche, 1):
+        print(f'\n{i}) search: {r["nome"]}')
+        print(f"query url: {r['url']} ", end='')
 
+        # Gestione dei filtri prezzo (nello schema SQL abbiamo i DEFAULT 0 e 99999)
+        p_min = r['prezzo_min']
+        p_max = r['prezzo_max']
+
+        # Stampiamo il range solo se non è quello di default
+        if p_min > 0 or p_max < 99999:
+            print(" | ", end='')
+            if p_min > 0:
+                print(f"{int(p_min)} < ", end='')
+            
+            print("price", end='')
+            
+            if p_max < 99999:
+                print(f" < {int(p_max)}", end='')
+        
+        print("\n")
+
+def refresh(notify):
+    '''Sveglia il bot e gli fa controllare tutte le ricerche attive nel DB'''
     try:
-        items_list = json_data['props']['pageProps']['initialState']['items']['list']
-    except KeyError:
-        items_list = []
+        # 1. Chiediamo al DB solo le ricerche che abbiamo segnato come 'attive'
+        cursor.execute("SELECT nome, url, prezzo_min, prezzo_max FROM ricerche WHERE attiva = 1")
+        ricerche = cursor.fetchall()
 
-    msg = []
+        if not ricerche:
+            print(f"{datetime.now().strftime('%H:%M:%S')} - 💤 Nessuna ricerca attiva nel DB.")
+            return
 
-    for item_wrapper in items_list:
-        product = item_wrapper.get('item')
+        # 2. Un unico ciclo per lanciarle tutte
+        for r in ricerche:
+            # Passiamo i dati alla funzione run_query (che abbiamo già adattato)
+            run_query(
+                url=r['url'], 
+                name=r['nome'], 
+                notify=notify, 
+                min_price=r['prezzo_min'], 
+                max_price=r['prezzo_max']
+            )
 
-        if not product:
-            continue
+    except requests.exceptions.ConnectionError:
+        print(f"{datetime.now().strftime('%Y-%m-%d, %H:%M:%S')} - 🌐 Errore di connessione (Check internet!)")
+    except requests.exceptions.Timeout:
+        print(f"{datetime.now().strftime('%Y-%m-%d, %H:%M:%S')} - ⏳ Il server di Subito non risponde (Timeout)")
+    except Exception as e:
+        # Usiamo str(e) perché a volte printare l'oggetto Exception direttamente dà errore
+        print(f"{datetime.now().strftime('%Y-%m-%d, %H:%M:%S')} - 🔥 Errore imprevisto: {str(e)}")
+
+def delete(toDelete):
+    '''Elimina una ricerca e tutti i suoi annunci dal DB in un colpo solo'''
+    try:
+        # 1. Eseguiamo il comando DELETE
+        # Grazie a ON DELETE CASCADE, eliminando la ricerca cancelliamo 
+        # automaticamente anche tutti gli annunci in 'annunci' legati a quel nome.
+        cursor.execute("DELETE FROM ricerche WHERE nome = ?", (toDelete,))
+        
+        # 2. Rendiamo la modifica permanente
+        conn.commit()
+
+        # 3. Controlliamo se abbiamo effettivamente segato qualcosa
+        if cursor.rowcount > 0:
+            print(f"🗑️ Ricerca '{toDelete}' e relativi annunci eliminati dal DB.")
+        else:
+            print(f"⚠️ Nessuna ricerca trovata col nome '{toDelete}'.")
+
+    except Exception as e:
+        print(f"❌ Errore durante l'eliminazione di {toDelete}: {str(e)}")
+
+def add(url, name, minPrice, maxPrice):
+    '''Aggiunge o aggiorna una ricerca nel database SQL'''
+    try:
+        # 1. Pulizia dei prezzi (Sanitization)
+        # Se arrivano come stringhe "null" o None, usiamo i limiti estremi
+        try:
+            mP = float(minPrice) if minPrice and str(minPrice).lower() != "null" else 0.0
+        except ValueError:
+            mP = 0.0
 
         try:
-            item_key = product.get('urn')
-            if not item_key: continue
+            MP = float(maxPrice) if maxPrice and str(maxPrice).lower() != "null" else 99999.0
+        except ValueError:
+            MP = 99999.0
 
-            title = product.get('subject', 'No Title')
+        # 2. Il comando magico: INSERT OR REPLACE
+        # Se 'name' esiste già, SQL sovrascrive la riga. Se non esiste, la crea.
+        # È molto più veloce del vecchio queries.get(name) + delete(name)
+        cursor.execute("""
+            INSERT OR REPLACE INTO ricerche (nome, url, prezzo_min, prezzo_max, attiva)
+            VALUES (?, ?, ?, ?, 1)
+        """, (name, url, mP, MP))
+
+        # 3. Rendiamo il tutto permanente
+        conn.commit()
+        
+        print(f"✅ Ricerca '{name}' configurata! Il bot la monitorerà al prossimo refresh.")
+
+    except Exception as e:
+        print(f"❌ Errore durante l'aggiunta al database: {str(e)}")
+
+def run_query(url, name, notify, min_price, max_price):
+    '''Versione ottimizzata: Log media mobile e fix notifiche primo avvio'''
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f" {timestamp} - 🕵️ Caccia aperta per: \"{name}\"")
+
+    try:
+        # 1. CACHE BUSTER & JITTER (Evita il blocco del daemon)
+        t.sleep(random.uniform(3, 7)) 
+        bust_url = f"{url}&t={int(t.time())}" if "?" in url else f"{url}?t={int(t.time())}"
+
+        response = session.get(
+            bust_url, 
+            impersonate="chrome110",
+            headers={"Accept-Language": "it-IT,it;q=0.9", "Cache-Control": "no-cache"},
+            timeout=20
+        )
+        response.raise_for_status() 
+        
+        script_tag = BeautifulSoup(response.text, 'html.parser').find('script', id='__NEXT_DATA__')
+        if not script_tag: return
+
+        items_list = json.loads(script_tag.string)['props']['pageProps']['initialState']['items']['list']
+
+        # 2. LOG MEDIA MOBILE (Refresh ogni giro)
+        cursor.execute("SELECT AVG(prezzo) FROM annunci WHERE categoria = ?", (name,))
+        res = cursor.fetchone()
+        media_attuale = res[0] if res and res[0] else 0
+        
+        # Log visibile in console
+        status_media = f"{media_attuale:.2f}€" if media_attuale > 0 else "Calcolo in corso..."
+        print(f"   📊 Media attuale mercato: {status_media}")
+
+        msg = []
+        low_bound = float(min_price) if str(min_price).lower() != "null" else 0
+        high_bound = float(max_price) if str(max_price).lower() != "null" else float('inf')
+
+        for item_wrapper in items_list:
+            product = item_wrapper.get('item')
+            if not product: continue
+
             link = product.get('urls', {}).get('default', '')
-            location = product.get('geo', {}).get('town', {}).get('value', 'Unknown town') + " (" + product.get('geo', {}).get('city', {}).get('shortName', 'Unknown province') + ")" 
-
-            # Price extraction
-            raw_price = None
-            price = "Unknown price"
-            features = product.get('features', {})
-            price_feature = features.get('/price')
-            if price_feature and 'values' in price_feature:
-                raw_price = price_feature['values'][0].get('key')
-
-            if raw_price:
-                try:
-                    price = int(raw_price)
-                except ValueError:
-                    pass
-
-            # Shipping extraction
-            shipping = None
-            features = product.get('features', {})
-            shipping_feature = features.get('/item_shippable')
-            raw_shipping = shipping_feature['values'][0].get('value')
-
-            if raw_shipping:
-                try:
-                    shipping = "(Shipping available)"
-                except ValueError:
-                    pass
-
-
+            title = product.get('subject', 'No Title')
             is_sold = product.get('sold', False)
+            location = product.get('geo', {}).get('town', {}).get('value', 'Unknown')
+            
+            try:
+                raw_p = product.get('features', {}).get('/price', {}).get('values', [{}])[0].get('key')
+                price = int(raw_p) if raw_p else 0
+            except: price = 0
 
-        except Exception as e:
-            continue
+            if is_sold:
+                cursor.execute("DELETE FROM annunci WHERE link = ?", (link,))
+                conn.commit()
+                continue
 
-        # check if the product has already been sold
-        if is_sold:
-            # if the product has previously been saved remove it from the file
-            if queries.get(name).get(url).get(minPrice).get(maxPrice).get(link):
-                del queries[name][url][minPrice][maxPrice][link]
-                products_deleted = True
-            continue
+            if price < low_bound or price > high_bound:
+                continue
 
-        if minPrice == "null" or price == "Unknown price" or price>=int(minPrice):
-            if maxPrice == "null" or price == "Unknown price" or price<=int(maxPrice):
-                if not queries.get(name).get(url).get(minPrice).get(maxPrice).get(link):   # found a new element
-                    tmp = (
-                        datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + "\n"
-                        + "*" + title + "*" + "\n"
-                        + "€ " + str(price) + " " + shipping + "\n"
-                        + location + "\n"
-                        + link + '\n'
-                    )
-                    msg.append(tmp)
-                    queries[name][url][minPrice][maxPrice][link] ={'title': title, 'price': price, 'location': location}
-                    print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " Adding result:", title, "-", price, "-", location)
+            cursor.execute("SELECT prezzo FROM annunci WHERE link = ?", (link,))
+            row = cursor.fetchone()
 
-    if len(msg) > 0:
-        if notify:
-            # Windows only: send notification
-            if not args.win_notifyoff and platform.system() == "Windows":
-                global toaster
-                toaster.show_toast("New announcements", "Query: " + name)
-            if is_telegram_active():
-                send_telegram_messages(msg)
-            if is_ntfy_active():
-                send_ntfy_messages(msg)
-            print("\n".join(msg))
-            print('\n{} new elements have been found.'.format(len(msg)))
-        save_queries()
-    else:
-        print('\nAll lists are already up to date.')
+            if row is None:
+                # --- NUOVO ELEMENTO ---
+                cursor.execute("INSERT INTO annunci (link, titolo, prezzo, categoria, localita) VALUES (?, ?, ?, ?, ?)", 
+                               (link, title, price, name, location))
+                conn.commit() # Commit immediato per il daemon
 
-        # if at least one search was deleted, update the search file
-        if products_deleted:
-            save_queries()
+                # FIX FIRST SCAN: Se media_attuale è 0, notifica tutto il primo blocco
+                if media_attuale == 0:
+                    msg.append(f"🏁 *PRIMA SCANSIONE*: {title}\n💰 {price}€\n🔗 {link}")
+                    print(f"   ✨ [FIRST SCAN] {title} - {price}€")
+                elif price < media_attuale:
+                    risparmio = media_attuale - price
+                    tag = "🔥 VERO AFFARE" if price < (media_attuale * 0.85) else "🆕 NUOVO"
+                    msg.append(f"{tag} (-{risparmio:.0f}€): {title}\n💰 {price}€ (Media: {media_attuale:.0f}€)\n🔗 {link}")
+                    print(f"   🎯 [STEAL] {title} - {price}€")
+                else:
+                    print(f"   ➕ [DB ONLY] {title} - {price}€ (Sopra media)")
 
-def save_queries():
-    '''A function to save the queries
-    '''
-    with open(dbFile, 'w') as file:
-        file.write(json.dumps(queries))
+            else:
+                # --- RIBASSI ---
+                old_price = row[0]
+                if price < old_price:
+                    cursor.execute("UPDATE annunci SET prezzo = ? WHERE link = ?", (price, link))
+                    conn.commit()
+                    msg.append(f"📉 RIBASSO: {title}\n💰 {price}€ (Era: {old_price}€)\n🔗 {link}")
 
+        # 4. NOTIFY
+        if msg and notify:
+            send_telegram_messages(msg)
+            
+    except Exception as e:
+        print(f"   ❌ Errore critico {name}: {str(e)}")
 def save_api_credentials():
     '''A function to save the telegram api credentials into the telegramApiFile'''
     with open(telegramApiFile, 'w') as file:
@@ -425,10 +423,9 @@ if __name__ == '__main__':
 
     ### Setup commands ###
 
-    load_queries()
     load_api_credentials()
     load_ntfy_config()
-
+    connect_database()
     if args.list:
         print(datetime.now().strftime("%Y-%m-%d, %H:%M:%S") + " printing current status...")
         print_queries()
@@ -469,8 +466,6 @@ if __name__ == '__main__':
     if args.refresh:
         refresh(True)
 
-    print()
-    save_queries()
 
 
     if args.daemon:
@@ -481,5 +476,7 @@ if __name__ == '__main__':
                 notify = True
                 print()
                 print(str(args.delay) + " seconds to next poll.")
-                save_queries()
+
             t.sleep(int(args.delay))
+    conn.close()
+    print("Database connection closed")
