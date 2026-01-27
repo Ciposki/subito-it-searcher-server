@@ -9,7 +9,7 @@ annunci.db
 # --- Virtual Environment (The bin, include, lib folders) ---
 bin/
 include/
-lib/
+lib*/
 lib64/
 pyvenv.cfg
 
