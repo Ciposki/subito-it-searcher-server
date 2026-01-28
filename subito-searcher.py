@@ -279,118 +279,131 @@ def get_market_int(category):
         "count":len(prezzi_cleaned),
         "min_alert":q1,
     }
+
 def run_query(url, name, notify, min_price, max_price):
-    '''Versione ottimizzata: Log media mobile e fix notifiche primo avvio'''
+    '''Versione Pro: Scansione multi-pagina (1-5) con logica Z-Score'''
     timestamp = datetime.now().strftime('%H:%M:%S')
-    print(f" {timestamp} - 🕵️ Caccia aperta per: \"{name}\"")
+    print(f" {timestamp} - 🕵️ Caccia aperta (5 pag) per: \"{name}\"")
+
+    msg = [] # Lista notifiche unica per tutte le pagine
 
     try:
-        #Market data 
-        stats=get_market_int(name)
-        mu=stats['mu'] if stats else 0
-        sigma=stats['sigma'] if stats else 0
+        # 1. ANALISI MERCATO (Lo facciamo una volta prima del loop)
+        stats = get_market_int(name)
+        mu = stats['mu'] if stats else 0
+        sigma = stats['sigma'] if stats else 0
+        status_stats = f"{mu:.2f}€ (σ:{sigma:.1f})" if mu > 0 else "Inizializzazione..."
+        print(f"   📊 Statistiche Mercato: {status_stats}")
 
-        status_media = f"{mu:.2f}€ (σ:{sigma:.1f})" if mu > 0 else "Inizializzazione..."
-        print(f"   📊 Mercato (21gg): {status_media}")
-
-        # 1. CACHE BUSTER & JITTER (Evita il blocco del daemon)
-        t.sleep(random.uniform(3, 7)) 
-        bust_url = f"{url}&t={int(t.time())}" if "?" in url else f"{url}?t={int(t.time())}"
-
-        response = session.get(
-            bust_url, 
-            impersonate="chrome110",
-            headers={"Accept-Language": "it-IT,it;q=0.9", "Cache-Control": "no-cache"},
-            timeout=20
-        )
-        response.raise_for_status() 
-        
-        script_tag = BeautifulSoup(response.text, 'html.parser').find('script', id='__NEXT_DATA__')
-        if not script_tag: return
-
-        items_list = json.loads(script_tag.string)['props']['pageProps']['initialState']['items']['list']
-
-        # 2. LOG MEDIA MOBILE (Refresh ogni giro)
-        cursor.execute("SELECT AVG(prezzo) FROM annunci WHERE categoria = ?", (name,))
-        res = cursor.fetchone()
-        media_attuale = res[0] if res and res[0] else 0
-        
-        # Log visibile in console
-        status_media = f"{media_attuale:.2f}€" if media_attuale > 0 else "Calcolo in corso..."
-        print(f"   📊 Media attuale mercato: {status_media}")
-
-        msg = []
-        low_bound = float(min_price) if str(min_price).lower() != "null" else 0
-        high_bound = float(max_price) if str(max_price).lower() != "null" else float('inf')
-
-        for item_wrapper in items_list:
-            product = item_wrapper.get('item')
-            if not product: continue
-
-            link = product.get('urls', {}).get('default', '')
-            title = product.get('subject', 'No Title')
-            is_sold = product.get('sold', False)
-            location = product.get('geo', {}).get('town', {}).get('value', 'Unknown')
+        # 2. CICLO PAGINE (da 1 a 5)
+        for page in range(1, 6):
+            # Costruzione URL con paginazione
+            connector = "&" if "?" in url else "?"
+            page_url = f"{url}{connector}o={page}"
             
-            try:
-                raw_p = product.get('features', {}).get('/price', {}).get('values', [{}])[0].get('key')
-                price = int(raw_p) if raw_p else 0
-            except: price = 0
+            # Jitter tra le pagine per non farsi sgamà
+            t.sleep(random.uniform(2, 4)) 
+            bust_url = f"{page_url}&t={int(t.time())}"
 
-            if is_sold:
-                cursor.execute("DELETE FROM annunci WHERE link = ?", (link,))
-                conn.commit()
-                continue
+            response = session.get(
+                bust_url, 
+                impersonate="chrome110",
+                headers={"Accept-Language": "it-IT,it;q=0.9", "Cache-Control": "no-cache"},
+                timeout=20
+            )
+            response.raise_for_status() 
+            
+            script_tag = BeautifulSoup(response.text, 'html.parser').find('script', id='__NEXT_DATA__')
+            if not script_tag: 
+                print(f"   ⚠️ Fine pagine disponibili alla {page}")
+                break # Esci dal ciclo se non c'è più nulla
 
-            if price < low_bound or price > high_bound:
-                continue
+            items_list = json.loads(script_tag.string)['props']['pageProps']['initialState']['items']['list']
+            if not items_list: break
 
-            cursor.execute("SELECT prezzo FROM annunci WHERE link = ?", (link,))
-            row = cursor.fetchone()
+            print(f"   📄 Analizzando Pagina {page}...")
 
-            if row is None:
-                # --- NUOVO ELEMENTO ---
-                cursor.execute("INSERT INTO annunci (link, titolo, prezzo, categoria, localita,data_scoperta, ultimo_aggiornamento) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", 
-                               (link, title, price, name, location))
-                conn.commit() # Commit immediato per il daemon
+            # Filtri di budget
+            low_bound = float(min_price) if str(min_price).lower() != "null" else 0
+            high_bound = float(max_price) if str(max_price).lower() != "null" else float('inf')
 
-                if mu == 0:
-                    print(f"   ✨ [FIRST SCAN] {title} - {price}€")
-                else:
-                    # CALCOLO Z-SCORE: quanto è lontano dalla media?
-                    z = (price - mu) / sigma if sigma > 0 else 0
-                    
-                    if z <= -1.0: # Diventiamo un po' più permissivi per non perde nulla
-                        if z <= -2.0:
-                            tag = "🚨 AFFARE IMPERDIBILE (Z-Score estremo)"
-                        elif z <= -1.5:
-                            tag = "🔥 VERO AFFARE (Ottimo margine)"
-                        else:
-                            tag = "💰 BUON PREZZO (Da valutare)"
-                    else:
-                        print(f"   ☁️  [SAVE] {title} - {price}€ (z:{z:.2f}) - Non abbastanza economico")
-            else:
-                # --- RIBASSI ---
-                old_price = row[0]
-                if price < old_price:
-                    cursor.execute("""
-                        UPDATE annunci 
-                        SET prezzo = ?, ultimo_aggiornamento = CURRENT_TIMESTAMP 
-                        WHERE link = ?
-                    """, (price, link))
-                    msg.append(f"📉 RIBASSO: {title}\n💰 {price}€ (Era: {old_price}€)\n🔗 {link}")
-                    print(f"   📉 [DROP] {title}: {old_price}€ -> {price}€")
-                else:
-                    # Aggiorniamo comunque il timestamp per tenerlo nei 21 giorni
-                    cursor.execute("UPDATE annunci SET ultimo_aggiornamento = CURRENT_TIMESTAMP WHERE link = ?", (link,))
+            for item_wrapper in items_list:
+                product = item_wrapper.get('item')
+                if not product: continue
+
+                link = product.get('urls', {}).get('default', '')
+                title = product.get('subject', 'No Title')
+                is_sold = product.get('sold', False)
+                location = product.get('geo', {}).get('town', {}).get('value', 'Unknown')
                 
-                conn.commit()
-        # 4. NOTIFY
+                try:
+                    raw_p = product.get('features', {}).get('/price', {}).get('values', [{}])[0].get('key')
+                    price = int(raw_p) if raw_p else 0
+                except: price = 0
+
+                # Gestione Venduti
+                if is_sold:
+                    cursor.execute("DELETE FROM annunci WHERE link = ?", (link,))
+                    conn.commit()
+                    continue
+
+                # Filtro Range Prezzo
+                if price < low_bound or price > high_bound: continue
+
+                # Controllo DB
+                cursor.execute("SELECT prezzo FROM annunci WHERE link = ?", (link,))
+                row = cursor.fetchone()
+
+                if row is None:
+                    # --- NUOVO ELEMENTO ---
+                    cursor.execute("""
+                        INSERT INTO annunci (link, titolo, prezzo, categoria, localita, data_scoperta, ultimo_aggiornamento) 
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, (link, title, price, name, location))
+                    conn.commit()
+
+                    if mu == 0:
+                        print(f"   ✨ [FIRST SCAN] {title} - {price}€")
+                    else:
+                        z = (price - mu) / sigma if sigma > 0 else 0
+                        
+                        if z <= -1.0:
+                            if z <= -2.0:
+                                tag = "🚨 AFFARE IMPERDIBILE"
+                            elif z <= -1.5:
+                                tag = "🔥 VERO AFFARE"
+                            else:
+                                tag = "💰 BUON PREZZO"
+                            
+                            risparmio = mu - price
+                            msg.append(f"{tag} (z:{z:.2f})\n📱 {title}\n💵 {price}€ (Media: {mu:.0f}€)\n📉 Sconto: {risparmio:.0f}€\n🔗 {link}")
+                            print(f"   🎯 [HIT] {title} - {price}€ (z:{z:.1f})")
+                        else:
+                            # Log opzionale per vedere cosa viene scartato (commentalo se troppi log)
+                            # print(f"   ☁️ [SAVE] {title} - {price}€ (z:{z:.2f})")
+                            pass
+                else:
+                    # --- GESTIONE RIBASSI O UPDATE ---
+                    old_price = row[0]
+                    if price < old_price:
+                        cursor.execute("""
+                            UPDATE annunci SET prezzo = ?, ultimo_aggiornamento = CURRENT_TIMESTAMP 
+                            WHERE link = ?
+                        """, (price, link))
+                        msg.append(f"📉 RIBASSO: {title}\n💰 {price}€ (Era: {old_price}€)\n🔗 {link}")
+                        print(f"   📉 [DROP] {title}: {old_price}€ -> {price}€")
+                    else:
+                        cursor.execute("UPDATE annunci SET ultimo_aggiornamento = CURRENT_TIMESTAMP WHERE link = ?", (link,))
+                    
+                    conn.commit()
+
+        # 3. INVIO NOTIFICHE (Tutto insieme alla fine delle 5 pagine)
         if msg and notify:
             send_telegram_messages(msg)
             
     except Exception as e:
         print(f"   ❌ Errore critico {name}: {str(e)}")
+
 def save_api_credentials():
     '''A function to save the telegram api credentials into the telegramApiFile'''
     with open(telegramApiFile, 'w') as file:
