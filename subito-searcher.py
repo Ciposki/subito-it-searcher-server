@@ -360,13 +360,13 @@ def run_query(url, name, notify, min_price, max_price):
                     # CALCOLO Z-SCORE: quanto è lontano dalla media?
                     z = (price - mu) / sigma if sigma > 0 else 0
                     
-                    if z <= -1.5:
-                        tag = "💎 AFFARE CLAMOROSO" if z <= -2.2 else "🔥 OTTIMO PREZZO"
-                        risparmio = mu - price
-                        msg.append(f"{tag} (z:{z:.1f})\n📱 {title}\n💰 {price}€ (Media: {mu:.0f}€)\n📉 Risparmio: {risparmio:.0f}€\n🔗 {link}")
-                        print(f"   🎯 [HIT] {title} - {price}€ (z:{z:.1f})")
-                    else:
-                        print(f"   ➕ [DB ONLY] {title} - {price}€ (z:{z:.1f})")            
+                    if z <= -1.0: # Diventiamo un po' più permissivi per non perde nulla
+                        if z <= -2.0:
+                            tag = "🚨 AFFARE IMPERDIBILE (Z-Score estremo)"
+                        elif z <= -1.5:
+                            tag = "🔥 VERO AFFARE (Ottimo margine)"
+                        else:
+                            tag = "💰 BUON PREZZO (Da valutare)"         
             else:
                 # --- RIBASSI ---
                 old_price = row[0]
