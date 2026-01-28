@@ -1,7 +1,5 @@
 # --- Project Specific Secrets ---
 telegram_api_credentials
-searches.tracked
-schema.sql
 
 # --- Database & Data ---
 *.db
@@ -10,12 +8,12 @@ annunci.db
 bin/
 include/
 lib*/
-lib64/
 pyvenv.cfg
 
 # --- Python Junk ---
 __pycache__/
 *.py[cod]
 
+lib64/
 # --- Editor Junk ---
 .netrwhist

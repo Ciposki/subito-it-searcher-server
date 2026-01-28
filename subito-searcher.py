@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.7
-
+import numpy as np
 import random
 import argparse
 from contextlib import nullcontext
@@ -8,8 +8,6 @@ from bs4 import BeautifulSoup, Tag
 import json
 import os
 import platform
-import requests
-import re
 import time as t
 import sqlite3
 import sys
@@ -253,13 +251,48 @@ def add(url, name, minPrice, maxPrice):
 
     except Exception as e:
         print(f"❌ Errore durante l'aggiunta al database: {str(e)}")
+def get_market_int(category):
+    query="""
+        SELECT prezzo FROM annunci
+        WHERE categoria = ?
+            AND ultimo_aggiornamento > datetime('now', '-21 days')
+        ORDER BY ultimo_aggiornamento DESC;
 
+    """
+    cursor.execute(query,(category,))
+    rows=cursor.fetchall()
+    if len(rows)<20:
+        return None
+    prezzi = np.sort(np.array([r['prezzo'] for r in rows]))
+
+    #Quartile 
+    q1,q3 =np.percentile(prezzi,[25, 75])
+    iqr=q3-q1
+
+    low_bound=q1-1.5*iqr 
+    up_bound=q3+1.5*iqr
+    prezzi_cleaned= prezzi[(prezzi>=low_bound) & (prezzi<=up_bound)]
+    if len(prezzi_cleaned)<10:return None 
+    return {
+        "mu":np.mean(prezzi_cleaned),
+        "sigma":np.std(prezzi_cleaned),
+        "count":len(prezzi_cleaned),
+        "min_alert":q1,
+    }
 def run_query(url, name, notify, min_price, max_price):
     '''Versione ottimizzata: Log media mobile e fix notifiche primo avvio'''
     timestamp = datetime.now().strftime('%H:%M:%S')
     print(f" {timestamp} - 🕵️ Caccia aperta per: \"{name}\"")
 
     try:
+        #Market data 
+        stats=get_market_int(name)
+        mu=stats['mu'] if stats else 0
+        sigma=stats['sigma'] if stats else 0
+
+        status_media = f"{mu:.2f}€ (σ:{sigma:.1f})" if mu > 0 else "Inizializzazione..."
+        print(f"   📊 Mercato (21gg): {status_media}")
+
         # 1. CACHE BUSTER & JITTER (Evita il blocco del daemon)
         t.sleep(random.uniform(3, 7)) 
         bust_url = f"{url}&t={int(t.time())}" if "?" in url else f"{url}?t={int(t.time())}"
@@ -317,30 +350,39 @@ def run_query(url, name, notify, min_price, max_price):
 
             if row is None:
                 # --- NUOVO ELEMENTO ---
-                cursor.execute("INSERT INTO annunci (link, titolo, prezzo, categoria, localita) VALUES (?, ?, ?, ?, ?)", 
+                cursor.execute("INSERT INTO annunci (link, titolo, prezzo, categoria, localita,data_scoperta, ultimo_aggiornamento) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", 
                                (link, title, price, name, location))
                 conn.commit() # Commit immediato per il daemon
 
-                # FIX FIRST SCAN: Se media_attuale è 0, notifica tutto il primo blocco
-                if media_attuale == 0:
-                    msg.append(f"🏁 *PRIMA SCANSIONE*: {title}\n💰 {price}€\n🔗 {link}")
+                if mu == 0:
                     print(f"   ✨ [FIRST SCAN] {title} - {price}€")
-                elif price < media_attuale:
-                    risparmio = media_attuale - price
-                    tag = "🔥 VERO AFFARE" if price < (media_attuale * 0.85) else "🆕 NUOVO"
-                    msg.append(f"{tag} (-{risparmio:.0f}€): {title}\n💰 {price}€ (Media: {media_attuale:.0f}€)\n🔗 {link}")
-                    print(f"   🎯 [STEAL] {title} - {price}€")
                 else:
-                    print(f"   ➕ [DB ONLY] {title} - {price}€ (Sopra media)")
-
+                    # CALCOLO Z-SCORE: quanto è lontano dalla media?
+                    z = (price - mu) / sigma if sigma > 0 else 0
+                    
+                    if z <= -1.5:
+                        tag = "💎 AFFARE CLAMOROSO" if z <= -2.2 else "🔥 OTTIMO PREZZO"
+                        risparmio = mu - price
+                        msg.append(f"{tag} (z:{z:.1f})\n📱 {title}\n💰 {price}€ (Media: {mu:.0f}€)\n📉 Risparmio: {risparmio:.0f}€\n🔗 {link}")
+                        print(f"   🎯 [HIT] {title} - {price}€ (z:{z:.1f})")
+                    else:
+                        print(f"   ➕ [DB ONLY] {title} - {price}€ (z:{z:.1f})")            
             else:
                 # --- RIBASSI ---
                 old_price = row[0]
                 if price < old_price:
-                    cursor.execute("UPDATE annunci SET prezzo = ? WHERE link = ?", (price, link))
-                    conn.commit()
+                    cursor.execute("""
+                        UPDATE annunci 
+                        SET prezzo = ?, ultimo_aggiornamento = CURRENT_TIMESTAMP 
+                        WHERE link = ?
+                    """, (price, link))
                     msg.append(f"📉 RIBASSO: {title}\n💰 {price}€ (Era: {old_price}€)\n🔗 {link}")
-
+                    print(f"   📉 [DROP] {title}: {old_price}€ -> {price}€")
+                else:
+                    # Aggiorniamo comunque il timestamp per tenerlo nei 21 giorni
+                    cursor.execute("UPDATE annunci SET ultimo_aggiornamento = CURRENT_TIMESTAMP WHERE link = ?", (link,))
+                
+                conn.commit()
         # 4. NOTIFY
         if msg and notify:
             send_telegram_messages(msg)
@@ -379,23 +421,34 @@ def is_telegram_active():
         True if telegram is active, False otherwise
     '''
     return not args.tgoff and "chatid" in apiCredentials and "token" in apiCredentials
-
 def send_telegram_messages(messages):
-    '''A function to send messages to telegram
+    '''Versione Pro: Usa POST, gestisce i crash e pulisce i testi'''
+    token = apiCredentials["token"]
+    chat_id = apiCredentials["chatid"]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    Arguments
-    ---------
-    messages: list
-        the list of messages to send
-
-    Example usage
-    -------------
-    >>> send_telegram_messages(["message1", "message2"])
-    '''
     for msg in messages:
-        request_url = "https://api.telegram.org/bot" + apiCredentials["token"] + "/sendMessage?chat_id=" + apiCredentials["chatid"] + "&parse_mode=markdown" + "&text=" + msg
-        requests.get(request_url)
+        # 1. Prepariamo il pacchetto dati
+        payload = {
+            "chat_id": chat_id,
+            "text": msg,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False
+        }
 
+        try:
+            # 2. Invio tramite POST (molto più stabile del GET)
+            # Usiamo la sessione globale se disponibile, o requests liscio
+            response = requests.post(url, json=payload, timeout=10)
+            
+            # 3. Se Telegram dà errore, lo scriviamo nel log
+            if response.status_code != 200:
+                print(f"   ⚠️ Telegram Error ({response.status_code}): {response.text}")
+            else:
+                print(f"   📨 Notifica inviata con successo!")
+
+        except Exception as e:
+            print(f"   ❌ Errore critico durante l'invio: {str(e)}")
 def in_between(now, start, end):
     '''A function to check if a time is in between two other times
 
