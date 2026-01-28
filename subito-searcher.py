@@ -376,11 +376,12 @@ def run_query(url, name, notify, min_price, max_price):
                                 tag = "💰 BUON PREZZO"
                             
                             risparmio = mu - price
-                            msg.append(f"{tag} (z:{z:.2f})\n📱 {title}\n💵 {price}€ (Media: {mu:.0f}€)\n📉 Sconto: {risparmio:.0f}€\n🔗 {link}")
+                            notifica_testo = f"{tag} (z:{z:.2f})\n📱 {title}\n💵 {price}€ (Media: {mu:.0f}€)\n📉 Sconto: {risparmio:.0f}€\n🔗 {link}"
+                            msg.append(notifica_testo) # <--- ORA LO CARICHIAMO SUL FURGONE
                             print(f"   🎯 [HIT] {title} - {price}€ (z:{z:.1f})")
                         else:
                             # Log opzionale per vedere cosa viene scartato (commentalo se troppi log)
-                            # print(f"   ☁️ [SAVE] {title} - {price}€ (z:{z:.2f})")
+                            print(f"   ☁️ [SAVE] {title} - {price}€ (z:{z:.2f})")
                             pass
                 else:
                     # --- GESTIONE RIBASSI O UPDATE ---
@@ -398,7 +399,7 @@ def run_query(url, name, notify, min_price, max_price):
                     conn.commit()
 
         # 3. INVIO NOTIFICHE (Tutto insieme alla fine delle 5 pagine)
-        if msg and notify:
+        if len(msg)>0:
             send_telegram_messages(msg)
             
     except Exception as e:
@@ -441,7 +442,7 @@ def send_telegram_messages(messages):
     token = apiCredentials["token"]
     chat_id = apiCredentials["chatid"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-
+    print("\nInizio a mandare le notifiche")
     for msg in messages:
         # 1. Prepariamo il pacchetto dati
         payload = {
