@@ -366,7 +366,9 @@ def run_query(url, name, notify, min_price, max_price):
                         elif z <= -1.5:
                             tag = "🔥 VERO AFFARE (Ottimo margine)"
                         else:
-                            tag = "💰 BUON PREZZO (Da valutare)"         
+                            tag = "💰 BUON PREZZO (Da valutare)"
+                    else:
+                        print(f"   ☁️  [SAVE] {title} - {price}€ (z:{z:.2f}) - Non abbastanza economico")
             else:
                 # --- RIBASSI ---
                 old_price = row[0]
