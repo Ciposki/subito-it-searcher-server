@@ -171,8 +171,21 @@ def print_sitrep():
         
         print("\n")
 
+def cleanup_old_annunci():
+    '''Removes ads older than 30 days to keep the DB light'''
+    try:
+        # We target the 'ultimo_aggiornamento' column
+        cursor.execute("DELETE FROM annunci WHERE ultimo_aggiornamento < datetime('now', '-30 days')")
+        conn.commit()
+        
+        if cursor.rowcount > 0:
+            print(f"🧹 Cleanup: Rimossi {cursor.rowcount} vecchi annunci che prendevano polvere.")
+    except Exception as e:
+        print(f"❌ Errore durante il cleanup: {str(e)}")
+
 def refresh(notify):
     '''Sveglia il bot e gli fa controllare tutte le ricerche attive nel DB'''
+    cleanup_old_annunci()
     try:
         # 1. Chiediamo al DB solo le ricerche che abbiamo segnato come 'attive'
         cursor.execute("SELECT nome, url, prezzo_min, prezzo_max FROM ricerche WHERE attiva = 1")
@@ -437,34 +450,42 @@ def is_telegram_active():
         True if telegram is active, False otherwise
     '''
     return not args.tgoff and "chatid" in apiCredentials and "token" in apiCredentials
+
 def send_telegram_messages(messages):
-    '''Versione Pro: Usa POST, gestisce i crash e pulisce i testi'''
-    token = apiCredentials["token"]
-    chat_id = apiCredentials["chatid"]
+    '''Versione Pro: Blasts messages to multiple chat IDs'''
+    token = apiCredentials.get("token")
+    # We check if chatid is a list; if it's just a single string, we wrap it in a list
+    chat_ids = apiCredentials.get("chatid")
+    
+    if isinstance(chat_ids, str):
+        chat_ids = [chat_ids]
+    elif not chat_ids:
+        print("⚠️ No chat IDs found in config.")
+        return
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    print("\nInizio a mandare le notifiche")
+    print(f"\n📡 Broadcasting notifications to {len(chat_ids)} recipients...")
+
     for msg in messages:
-        # 1. Prepariamo il pacchetto dati
-        payload = {
-            "chat_id": chat_id,
-            "text": msg,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False
-        }
+        for cid in chat_ids:
+            payload = {
+                "chat_id": cid,
+                "text": msg,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": False
+            }
 
-        try:
-            # 2. Invio tramite POST (molto più stabile del GET)
-            # Usiamo la sessione globale se disponibile, o requests liscio
-            response = requests.post(url, json=payload, timeout=10)
-            
-            # 3. Se Telegram dà errore, lo scriviamo nel log
-            if response.status_code != 200:
-                print(f"   ⚠️ Telegram Error ({response.status_code}): {response.text}")
-            else:
-                print(f"   📨 Notifica inviata con successo!")
+            try:
+                response = requests.post(url, json=payload, timeout=10)
+                
+                if response.status_code != 200:
+                    print(f"  ⚠️ Error for ID {cid} ({response.status_code}): {response.text}")
+                else:
+                    print(f"  📨 Sent to {cid}")
 
-        except Exception as e:
-            print(f"   ❌ Errore critico durante l'invio: {str(e)}")
+            except Exception as e:
+                print(f"  ❌ Critical failure for ID {cid}: {str(e)}")
+
 def in_between(now, start, end):
     '''A function to check if a time is in between two other times
 
